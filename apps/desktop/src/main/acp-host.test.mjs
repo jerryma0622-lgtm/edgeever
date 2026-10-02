@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { realpathSync } from "node:fs";
+import { accessSync, realpathSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
@@ -275,7 +275,13 @@ describe("ACP command allow-list", () => {
       const deps = { platform: "darwin", pathEnv: bin, home: directory, executablePath: "/usr/bin/node" };
       expect(resolveAcpCommand({ id: "deepseekHarness" }, deps).command).toEqual({ command: realpathSync(dsh), args: ["--profile", "acp"] });
       expect(resolveAcpCommand({ id: "piAgent" }, deps).command).toEqual({ command: realpathSync(piAcp), args: [] });
-      expect(detectInstalledAgentApps({ platform: "darwin", pathEnv: bin, home: directory })).toContain("piAgent");
+      expect(detectInstalledAgentApps({
+        platform: "darwin", pathEnv: "/usr/local/bin", home: directory,
+        access(candidate) {
+          if (candidate !== "/usr/local/bin/pi") throw new Error("missing");
+          accessSync(pi);
+        },
+      })).toContain("piAgent");
       const localBin = path.join(directory, ".local", "bin");
       await mkdir(localBin, { recursive: true });
       await writeFile(path.join(localBin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -332,7 +338,7 @@ describe("ACP command allow-list", () => {
     expect(installs).toBe(1);
   });
 
-  test("looks up codex-acp.exe only as a win32 basename", () => {
+  test("looks up Windows native and npm shim basenames", () => {
     const seen = [];
     resolveAcpCommand({ id: "codex" }, {
       platform: "win32",
@@ -346,7 +352,7 @@ describe("ACP command allow-list", () => {
         throw error;
       },
     });
-    expect(seen).toEqual(["C:\\Tools\\codex-acp", "C:\\Tools\\codex-acp.exe"]);
+    expect(seen).toEqual(["C:\\Tools\\codex-acp.exe", "C:\\Tools\\codex-acp.cmd", "C:\\Tools\\codex-acp", "C:\\Tools\\codex-acp.ps1"]);
   });
 
   test("runs an installed Grok Build CLI through its built-in ACP mode", async () => {
@@ -574,7 +580,9 @@ describe("ACP spawn and failure mapping", () => {
 // bun test started at the workspace root drops child stdin and stdout pipes
 // (the bytes never arrive). The same processes work when cwd is apps/desktop,
 // which is how `bun run test:desktop` runs this file.
-const stdioPipesWork = await (async () => {
+// These legacy session fixtures execute POSIX shebangs (including wrap.sh).
+// Windows command resolution and spawn plans are tested separately below.
+const stdioPipesWork = process.platform !== "win32" && await (async () => {
   const proc = Bun.spawn(["/bin/echo", "ok"], { stdout: "pipe", stderr: "ignore" });
   const text = await new Response(proc.stdout).text();
   await proc.exited;
@@ -938,4 +946,79 @@ test("desktop preload and main process expose the ACP host", async () => {
   registerAcpIpc({ handle: (channel, handler) => handlers.set(channel, handler) });
   expect([...handlers.keys()]).toEqual(["desktop:acp-list", "desktop:acp-probe", "desktop:acp-install", "desktop:acp-authenticate", "desktop:acp-prompt", "desktop:acp-cancel"]);
   expect(() => handlers.get("desktop:acp-prompt")({ sender: {} }, { prompt: "test" })).toThrow("acp_prompt_forbidden");
+});
+
+describe("Windows Codex npm shim regression", () => {
+  const withNpmPrefix = async (shims, run) => {
+    const prefix = await mkdtemp(path.join(tmpdir(), "edgeever-codex-npm-"));
+    const entry = path.join(prefix, "node_modules", "@agentclientprotocol", "codex-acp", "dist", "index.js");
+    try {
+      await mkdir(path.dirname(entry), { recursive: true });
+      await writeFile(entry, "// npm ACP entry\n");
+      for (const shim of shims) await writeFile(path.join(prefix, shim), "// shim must never be spawned\n");
+      // Native separators let these Windows resolution cases run on Unix CI too.
+      const deps = { platform: "win32", pathEnv: prefix, sep: path.sep, delimiter: path.delimiter, executablePath: path.join(prefix, "Electron Runtime", "EdgeEver.exe") };
+      await run({ prefix, entry, deps });
+    } finally {
+      await rm(prefix, { recursive: true, force: true });
+    }
+  };
+
+  for (const shims of [["codex-acp.cmd"], ["codex-acp.ps1"], ["codex-acp.cmd", "codex-acp.ps1"], ["codex-acp", "codex-acp.cmd", "codex-acp.ps1"]]) {
+    test(`resolves ${shims.join(" + ")} without a native executable`, async () => {
+      await withNpmPrefix(shims, async ({ entry, deps }) => {
+        expect(resolveAcpCommand({ id: "codex" }, deps)).toEqual({
+          ok: true,
+          command: { command: deps.executablePath, args: [entry], env: { ELECTRON_RUN_AS_NODE: "1" } },
+        });
+      });
+    });
+  }
+
+  test("spawns Electron with the npm JS entry and shell false, never the cmd shim", async () => {
+    await withNpmPrefix(["codex-acp.cmd", "codex-acp.ps1"], async ({ prefix, entry, deps }) => {
+      const resolved = resolveAcpCommand({ id: "codex", path: "codex-acp.cmd" }, deps);
+      expect(resolved.ok).toBe(true);
+      const child = new EventEmitter();
+      let captured;
+      await spawnAcpChild((command, args, options) => {
+        captured = { command, args, options };
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      }, resolved.command, prefix);
+      expect(captured.command).toBe(deps.executablePath);
+      expect(captured.args).toEqual([entry]);
+      expect(captured.options).toMatchObject({ shell: false, windowsHide: true, stdio: ["pipe", "pipe", "ignore"], env: { ELECTRON_RUN_AS_NODE: "1" } });
+    });
+  });
+
+  test("keeps a native Windows executable ahead of npm shims", async () => {
+    await withNpmPrefix(["codex-acp.exe", "codex-acp.cmd"], async ({ prefix, deps }) => {
+      expect(resolveAcpCommand({ id: "codex" }, deps)).toEqual({ ok: true, command: path.join(prefix, "codex-acp.exe") });
+    });
+  });
+
+  for (const invalidEntry of ["missing", "directory"]) {
+    test(`rejects a ${invalidEntry} npm JS entry instead of spawning the shim`, async () => {
+      await withNpmPrefix(["codex-acp.cmd"], async ({ entry, deps }) => {
+        await rm(entry);
+        if (invalidEntry === "directory") await mkdir(entry);
+        expect(resolveAcpCommand({ id: "codex" }, deps)).toEqual({ ok: false, state: "failed", detail: "invalid_npm_entry" });
+      });
+    });
+  }
+
+  for (const platform of ["darwin", "linux"]) {
+    test(`preserves the ${platform} bare executable without npm entry lookup`, () => {
+      const seen = [];
+      const binary = `/usr/local/bin/codex-acp`;
+      expect(resolveAcpCommand({ id: "codex" }, {
+        platform, pathEnv: "/usr/local/bin", sep: "/", delimiter: ":",
+        accessSync(candidate) { seen.push(candidate); if (candidate !== binary) throw new Error("missing"); },
+        statSync() { throw new Error("Unix resolution must not inspect an npm entry"); },
+      })).toEqual({ ok: true, command: binary });
+      expect(seen).toEqual([binary]);
+      expect(resolveAcpCommand({ id: "codex", path: "codex-acp.cmd" }, { platform })).toEqual({ ok: false, state: "failed", detail: "invalid_path" });
+    });
+  }
 });

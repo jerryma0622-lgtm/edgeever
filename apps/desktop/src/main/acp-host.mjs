@@ -58,7 +58,7 @@ const trackChild = (child) => {
 };
 
 export const codexBasenames = (platform = process.platform) => (
-  platform === "win32" ? ["codex-acp", "codex-acp.exe"] : ["codex-acp"]
+  platform === "win32" ? ["codex-acp.exe", "codex-acp.cmd", "codex-acp", "codex-acp.ps1"] : ["codex-acp"]
 );
 
 const slashRejected = (value) => value.includes("/") || value.includes("\\") || value.includes("\0");
@@ -251,7 +251,23 @@ function resolveCodex(configured, deps) {
     names = [name];
   }
   const command = findOnPath(names, deps);
-  return command ? { ok: true, command } : { ok: false, state: "not_installed" };
+  if (!command) return { ok: false, state: "not_installed" };
+  if (deps.platform === "win32" && !command.toLowerCase().endsWith(".exe")) {
+    // npm shims are scripts; CreateProcess cannot execute them with shell:false.
+    const entry = path.join(path.dirname(command), "node_modules", "@agentclientprotocol", "codex-acp", "dist", "index.js");
+    try {
+      if (!deps.stat(entry).isFile()) throw new Error("invalid_npm_entry");
+      deps.access(entry, fsConstants.R_OK);
+    } catch {
+      return { ok: false, state: "failed", detail: "invalid_npm_entry" };
+    }
+    return { ok: true, command: {
+      command: deps.executablePath,
+      args: [entry],
+      env: { ELECTRON_RUN_AS_NODE: "1" },
+    } };
+  }
+  return { ok: true, command };
 }
 
 function resolveAntigravity(configured, { realpath, stat }) {
