@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { PassThrough } from "node:stream";
 import { RequestError } from "@agentclientprotocol/sdk";
 import {
   acpInitializeParams,
@@ -19,9 +20,11 @@ import {
   isAuthRequiredError,
   promptResultFailure,
   registerAcpIpc,
+  removeAcpWorkspace,
   resolveAcpCommand,
   sanitizeFailureDetail,
   spawnAcpChild,
+  stopAcpChild,
 } from "./acp-host.mjs";
 
 const require = createRequire(import.meta.url);
@@ -1021,4 +1024,191 @@ describe("Windows Codex npm shim regression", () => {
       expect(resolveAcpCommand({ id: "codex", path: "codex-acp.cmd" }, { platform })).toEqual({ ok: false, state: "failed", detail: "invalid_path" });
     });
   }
+});
+
+describe("ACP workspace cleanup lifecycle", () => {
+  test("stop is idempotent and escalates a child that ignores SIGTERM", async () => {
+    const child = new EventEmitter();
+    const signals = [];
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === "SIGKILL") {
+        child.signalCode = signal;
+        queueMicrotask(() => child.emit("close", null, signal));
+      }
+      return true;
+    };
+    const stopped = stopAcpChild(child);
+    expect(stopAcpChild(child)).toBe(stopped);
+    await stopped;
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    await stopAcpChild(child);
+    expect(signals).toHaveLength(2);
+  });
+
+  test("stop fails within a bounded time when close never arrives", async () => {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = () => true;
+    try {
+      await expect(stopAcpChild(child)).rejects.toThrow("child_stop_timeout");
+    } finally {
+      child.emit("close", null, "SIGKILL");
+    }
+  });
+
+  const withLifecycle = async (options, run) => {
+    const root = await mkdtemp(path.join(tmpdir(), "edgeever-acp-cleanup-test-"));
+    const order = [];
+    let workspace;
+    let closed = false;
+    let closePromise;
+    let promptId;
+    const runtime = createAcpHostRuntime({
+      tmpRoot: root,
+      adapterManager: {
+        get: () => options.install ? null : { command: { command: process.execPath, args: [] } },
+        install: async (_id, validate) => ({ updated: true, adapter: await validate({ command: process.execPath, args: [] }) }),
+      },
+      mcpAccess: options.bridge ? () => ({}) : undefined,
+      startMcpBridge: async () => ({ url: "http://127.0.0.1:1", secret: "test-only", async close() {
+        order.push("bridge.close.start");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        order.push("bridge.close.end");
+      } }),
+      spawnImpl(_command, _args, spawnOptions) {
+        workspace = spawnOptions.cwd;
+        const child = new EventEmitter();
+        child.stdin = new PassThrough();
+        child.stdout = new PassThrough();
+        child.exitCode = null;
+        child.signalCode = null;
+        closePromise = new Promise((resolve) => child.once("close", resolve));
+        const respond = (id, result, error) => child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...(error ? { error } : { result }) })}\n`);
+        let input = "";
+        child.stdin.on("data", (chunk) => {
+          input += chunk;
+          const lines = input.split("\n");
+          input = lines.pop();
+          for (const line of lines) {
+            const request = JSON.parse(line);
+            if (request.method === "initialize") respond(request.id, { protocolVersion: request.params.protocolVersion, agentCapabilities: {}, authMethods: options.authenticate ? [{ id: "test", name: "Test" }] : [] });
+            if (request.method === "authenticate") respond(request.id, {});
+            if (request.method === "session/new") {
+              if (options.failedHandshake) respond(request.id, null, { code: -32603, message: "test_handshake_failed" });
+              else respond(request.id, { sessionId: "cleanup-session" });
+            }
+            if (request.method === "session/prompt") {
+              order.push("prompt");
+              promptId = request.id;
+              if (!options.hold) respond(request.id, { stopReason: "end_turn" });
+            }
+            if (request.method === "session/cancel" && promptId) respond(promptId, { stopReason: "cancelled" });
+          }
+        });
+        child.kill = (signal) => {
+          order.push(`kill.${signal}`);
+          child.signalCode = signal;
+          order.push("child.exit");
+          child.emit("exit", null, signal);
+          setTimeout(() => {
+            closed = true;
+            child.stdout.end();
+            order.push("child.close");
+            child.emit("close", null, signal);
+          }, 25);
+          return true;
+        };
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      },
+      async rm(directory, rmOptions) {
+        // exit alone is insufficient: stdio can still hold workspace handles.
+        expect(closed).toBe(true);
+        order.push("rm");
+        if (options.cleanupError) throw Object.assign(new Error("cleanup_failed"), { code: "EACCES" });
+        await rm(directory, rmOptions);
+      },
+    });
+    try { await run({ runtime, order, get workspace() { return workspace; } }); }
+    finally {
+      if (closePromise) await closePromise;
+      await rm(root, { recursive: true, force: true });
+    }
+  };
+
+  test("probe waits for child close, not merely exit, before removing its workspace", async () => {
+    await withLifecycle({}, async (fixture) => {
+      expect((await fixture.runtime.probeAdapter({ id: "codex" })).state).toBe("available");
+      expect(fixture.order).toEqual(["kill.SIGTERM", "child.exit", "child.close", "rm"]);
+      expect(typeof fixture.workspace).toBe("string");
+      expect(() => accessSync(fixture.workspace)).toThrow();
+    });
+  });
+
+  test("failed session setup also waits for child close before cleanup", async () => {
+    await withLifecycle({ failedHandshake: true }, async ({ runtime, order }) => {
+      expect((await runtime.probeAdapter({ id: "codex" })).state).toBe("failed");
+      expect(order).toEqual(["kill.SIGTERM", "child.exit", "child.close", "rm"]);
+    });
+  });
+
+  test("authentication waits for child close before cleaning up its verified session", async () => {
+    await withLifecycle({ authenticate: true }, async ({ runtime, order }) => {
+      expect((await runtime.authenticateAdapter({ id: "codex", methodId: "test" })).state).toBe("available");
+      expect(order).toEqual(["kill.SIGTERM", "child.exit", "child.close", "rm"]);
+    });
+  });
+
+  test("managed install validation completes cleanup before accepting the adapter", async () => {
+    await withLifecycle({ install: true }, async ({ runtime, order }) => {
+      expect((await runtime.installAdapter("codex")).adapter.state).toBe("available");
+      expect(order).toEqual(["kill.SIGTERM", "child.exit", "child.close", "rm"]);
+    });
+  });
+
+  test("prompt completion waits for child, bridge and workspace cleanup", async () => {
+    await withLifecycle({ bridge: true }, async ({ runtime, order }) => {
+      const events = collector();
+      await runtime.prompt({ adapterId: "codex", prompt: "test" }, (event) => { order.push(event.type); events.emit(event); });
+      await events.waitFor((event) => event.type === "done");
+      expect(order).toEqual(["prompt", "kill.SIGTERM", "child.exit", "child.close", "bridge.close.start", "bridge.close.end", "rm", "done"]);
+    });
+  });
+
+  test("cancellation shares cleanup with prompt settlement and leaves no duplicate done event", async () => {
+    await withLifecycle({ bridge: true, hold: true }, async ({ runtime, order }) => {
+      const events = collector();
+      const { requestId } = await runtime.prompt({ adapterId: "codex", prompt: "test" }, events.emit);
+      expect(await runtime.cancel(requestId)).toEqual({ ok: true });
+      expect(await runtime.cancel(requestId)).toEqual({ ok: true });
+      expect(events.events.filter((event) => event.type === "done")).toHaveLength(1);
+      expect(order.filter((event) => event === "rm")).toHaveLength(1);
+      expect(order.indexOf("child.close")).toBeLessThan(order.indexOf("bridge.close.start"));
+      expect(order.indexOf("bridge.close.end")).toBeLessThan(order.indexOf("rm"));
+    });
+  });
+
+  test("reports a cleanup failure through the prompt error event", async () => {
+    await withLifecycle({ bridge: true, cleanupError: true }, async ({ runtime }) => {
+      const events = collector();
+      await runtime.prompt({ adapterId: "codex", prompt: "test" }, events.emit);
+      expect((await events.waitFor((event) => event.type === "error")).message).toBe("cleanup_failed");
+      expect(events.events.filter((event) => event.type === "done")).toHaveLength(0);
+    });
+  });
+
+  test("workspace deletion uses bounded short retries only on Windows", async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "edgeever-acp-retries-"));
+    try {
+      let captured;
+      await removeAcpWorkspace(workspace, async (_directory, options) => { captured = options; });
+      expect(captured).toEqual({ recursive: true, force: true, ...(process.platform === "win32" ? { maxRetries: 3, retryDelay: 100 } : {}) });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
 });

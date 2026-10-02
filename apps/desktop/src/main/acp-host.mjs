@@ -32,6 +32,7 @@ const WORKSPACE_MARKER = `${path.sep}edgeever-acp-`;
 const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
 const liveChildren = new Set();
+const childLifecycles = new WeakMap();
 let exitHooked = false;
 
 const clientVersion = () => {
@@ -45,8 +46,17 @@ const clientVersion = () => {
 
 const trackChild = (child) => {
   if (!child) return;
+  if (childLifecycles.has(child)) return childLifecycles.get(child);
+  const lifecycle = { closed: false, stopping: null };
+  lifecycle.close = new Promise((resolve) => {
+    child.once("close", () => {
+      lifecycle.closed = true;
+      liveChildren.delete(child);
+      resolve();
+    });
+  });
+  childLifecycles.set(child, lifecycle);
   liveChildren.add(child);
-  child.once?.("exit", () => liveChildren.delete(child));
   if (!exitHooked) {
     exitHooked = true;
     process.once("exit", () => {
@@ -55,6 +65,7 @@ const trackChild = (child) => {
       }
     });
   }
+  return lifecycle;
 };
 
 export const codexBasenames = (platform = process.platform) => (
@@ -613,7 +624,10 @@ export async function removeAcpWorkspace(directory, rmImpl = rm) {
   if (typeof directory !== "string" || !directory) return;
   const resolved = path.resolve(directory);
   if (resolved === path.resolve(homedir()) || !resolved.includes(WORKSPACE_MARKER)) return;
-  await rmImpl(resolved, { recursive: true, force: true });
+  await rmImpl(resolved, {
+    recursive: true, force: true,
+    ...(process.platform === "win32" ? { maxRetries: 3, retryDelay: 100 } : {}),
+  });
 }
 
 const normalizePromptCapabilities = (initialized) => {
@@ -669,17 +683,26 @@ const createEdgeEverAcpClient = (requestId, emit, allowPermissions) => ({
   },
 });
 
-function stopChild(child) {
-  if (!child) return;
-  const killTimer = setTimeout(() => {
-    if (child.exitCode == null) {
-      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+export function stopAcpChild(child) {
+  if (!child) return Promise.resolve();
+  const lifecycle = trackChild(child);
+  if (lifecycle.closed) return Promise.resolve();
+  if (lifecycle.stopping) return lifecycle.stopping;
+  lifecycle.stopping = new Promise((resolve, reject) => {
+    const killTimer = setTimeout(() => {
+      if (child.exitCode == null && child.signalCode == null) {
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      }
+    }, 500);
+    const timeout = setTimeout(() => reject(new Error("child_stop_timeout")), 3_000);
+    const clearTimers = () => { clearTimeout(killTimer); clearTimeout(timeout); };
+    lifecycle.close.then(() => { clearTimers(); resolve(); });
+    try { child.stdin?.destroy(); } catch { /* closed */ }
+    if (child.exitCode == null && child.signalCode == null) {
+      try { child.kill("SIGTERM"); } catch { /* already gone */ }
     }
-  }, 500);
-  killTimer.unref?.();
-  child.once?.("exit", () => clearTimeout(killTimer));
-  try { child.stdin?.destroy(); } catch { /* closed */ }
-  try { child.kill("SIGTERM"); } catch { /* already gone */ }
+  });
+  return lifecycle.stopping;
 }
 
 const promptFailureMessage = (failure) => {
@@ -739,7 +762,8 @@ export function createAcpHostRuntime(options = {}) {
     const cwd = await createAcpWorkspace(mkdtempImpl, options.tmpRoot);
     let child = null;
     let authMethods = [];
-    const abort = () => stopChild(child);
+    const stop = () => stopAcpChild(child);
+    const abort = () => { void stop().catch(() => {}); };
     signal?.addEventListener("abort", abort, { once: true });
     try {
       if (signal?.aborted) throw Object.assign(new Error("connection_timeout"), { code: "TIMEOUT" });
@@ -763,16 +787,22 @@ export function createAcpHostRuntime(options = {}) {
         sessionId: session.sessionId,
         authMethods,
         promptCapabilities: normalizePromptCapabilities(initialized),
-        stop: abort,
+        stop,
       };
     } catch (error) {
       if (authMethods.length && error && typeof error === "object") error.authMethods = authMethods;
-      abort();
+      await stop();
       await removeAcpWorkspace(cwd, rmImpl);
       throw error;
     } finally {
       signal?.removeEventListener("abort", abort);
     }
+  };
+
+  const cleanup = async (connected, bridge) => {
+    try { await connected.stop(); }
+    finally { await bridge?.close(); }
+    await removeAcpWorkspace(connected.cwd, rmImpl);
   };
 
   const withHandshakeTimeout = async (operation, timeoutMs = handshakeTimeoutMs) => {
@@ -818,8 +848,7 @@ export function createAcpHostRuntime(options = {}) {
             return { ...adapterShell(id), ...failureFields(classifyAcpFailure(error)), ...(isAuthRequiredError(error) ? { authMethods: error.authMethods ?? [] } : {}) };
           } finally {
             if (connected) {
-              connected.stop();
-              await removeAcpWorkspace(connected.cwd, rmImpl);
+              await cleanup(connected);
             }
           }
         }, { updateOnly });
@@ -888,8 +917,7 @@ export function createAcpHostRuntime(options = {}) {
         ...(resolved.version ? { version: resolved.version, managed: true } : {}),
       };
       latestStatus.set(id, adapter);
-      connected.stop();
-      await removeAcpWorkspace(connected.cwd, rmImpl);
+      await cleanup(connected);
       return adapter;
     },
 
@@ -909,8 +937,7 @@ export function createAcpHostRuntime(options = {}) {
         return { ...adapterShell(id), ...failureFields(classifyAcpFailure(error)), ...(isAuthRequiredError(error) ? { authMethods: error.authMethods ?? [] } : {}), ...(resolved.version ? { version: resolved.version, managed: true } : {}) };
       } finally {
         if (connected) {
-          connected.stop();
-          await removeAcpWorkspace(connected.cwd, rmImpl);
+          await cleanup(connected);
         }
       }
     },
@@ -959,9 +986,7 @@ export function createAcpHostRuntime(options = {}) {
           });
         }
       } catch (error) {
-        connected.stop();
-        await removeAcpWorkspace(connected.cwd, rmImpl);
-        await mcpBridge?.close();
+        await cleanup(connected, mcpBridge);
         return fail(promptFailureMessage(classifyAcpFailure(error)));
       }
 
@@ -973,29 +998,36 @@ export function createAcpHostRuntime(options = {}) {
       };
       active.set(requestId, session);
       const finish = (event) => {
-        if (session.settled) return;
+        if (session.finishing) return session.finishing;
         session.settled = true;
-        notify(event);
-        session.stop();
-        active.delete(requestId);
-        void removeAcpWorkspace(session.cwd, rmImpl);
-        void session.mcpBridge?.close();
+        session.finishing = (async () => {
+          try {
+            await cleanup(session, session.mcpBridge);
+            notify(event);
+          } catch (error) {
+            notify({ requestId, type: "error", message: promptFailureMessage(classifyAcpFailure(error)) });
+          } finally {
+            active.delete(requestId);
+          }
+        })();
+        return session.finishing;
       };
+      session.finish = finish;
       void connected.connection.prompt({ sessionId: connected.sessionId, prompt: content.blocks }).then((result) => {
         if (session.cancelled) return finish({ requestId, type: "done" });
         const failure = promptResultFailure(result);
         if (failure === "needs_login") {
           latestStatus.set(input.adapterId, { ...adapterShell(input.adapterId), state: "needs_login", authMethods: connected.authMethods });
         }
-        finish(failure ? { requestId, type: "error", message: failure } : { requestId, type: "done" });
+        return finish(failure ? { requestId, type: "error", message: failure } : { requestId, type: "done" });
       }).catch((error) => {
-        if (session.cancelled) finish({ requestId, type: "done" });
+        if (session.cancelled) return finish({ requestId, type: "done" });
         else {
           const failure = classifyAcpFailure(error);
           if (failure.state === "needs_login") {
             latestStatus.set(input.adapterId, { ...adapterShell(input.adapterId), state: "needs_login", authMethods: connected.authMethods });
           }
-          finish({ requestId, type: "error", message: promptFailureMessage(failure) });
+          return finish({ requestId, type: "error", message: promptFailureMessage(failure) });
         }
       });
       return { requestId, rejectedAttachments: content.rejectedAttachments };
@@ -1010,8 +1042,7 @@ export function createAcpHostRuntime(options = {}) {
       } catch {
         // The process may already be gone. Killing it is enough.
       }
-      session.stop();
-      void session.mcpBridge?.close();
+      await session.finish({ requestId, type: "done" });
       return { ok: true };
     },
   };
